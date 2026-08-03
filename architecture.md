@@ -110,3 +110,99 @@ genzzi-tms-backend/
 ```
 
 ---
+### 3. Request-Flow Walkthrough: "Create a Task"
+
+To illustrate how the layers interact, this is the step-by-step lifecycle of a `POST /api/v1/projects/:projectId/tasks` request to create a new task.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor User as Client (User)
+    participant R as Router
+    participant AM as Auth Middleware
+    participant VM as Validation Middleware
+    participant C as Task Controller
+    participant S as Task Service
+    participant PR as Project Member Repository
+    participant TR as Task Repository
+    participant DB as PostgreSQL
+
+    User->>R: POST /projects/p-123/tasks [Body: title, assigneeId] + [Header: Bearer Token]
+    
+    activate R
+    R->>AM: Authenticate Token
+    activate AM
+    Note over AM: Extracts JWT from Header.<br/>Decodes & verifies signature using secret.<br/>Appends req.user = { id: "u-456", email: "..." }
+    AM-->>R: Valid Token
+    deactivate AM
+
+    R->>VM: Validate Body Schema
+    activate VM
+    Note over VM: Compares request body<br/>against Zod schema validation rules.
+    VM-->>R: Validation Passed
+    deactivate VM
+
+    R->>C: createTask(req, res, next)
+    activate C
+    Note over C: Extracts projectId ("p-123") from URL params,<br/>body payload, and creatorId ("u-456") from req.user.
+    
+    C->>S: TaskService.createTask({ projectId, title, assigneeId, creatorId })
+    activate S
+    
+    S->>PR: findMember("p-123", "u-456")
+    activate PR
+    PR->>DB: SELECT * FROM "ProjectMember" WHERE projectId = 'p-123' AND userId = 'u-456'
+    DB-->>PR: Member records (Role = MEMBER)
+    PR-->>S: ProjectMember { role: MEMBER }
+    deactivate PR
+    
+    Note over S: Verifies authorization:<br/>Members/Admins can write tasks. Viewers cannot.<br/>Authorization checks out.
+
+    S->>TR: createTask({ projectId, title, assigneeId, creatorId })
+    activate TR
+    TR->>DB: INSERT INTO "Task" (id, title, status, priority, projectId, assigneeId, creatorId) VALUES (...)
+    DB-->>TR: Returning inserted Task record
+    TR-->>S: Created Task Entity
+    deactivate TR
+
+    S-->>C: Created Task Business Object
+    deactivate S
+
+    C-->>User: HTTP 201 Created (JSON Payload: { status: "success", data: task })
+    deactivate C
+    deactivate R
+```
+
+### Detailed Layer Description
+
+1. **Client Request**:
+   - The client submits a `POST` request to `https://api.genzzi-tms.com/api/v1/projects/p-123/tasks` with JSON payload: `{"title": "Implement auth integration", "assigneeId": "u-789", "priority": "HIGH"}`. The Authorization header contains a valid JWT: `Bearer Token`.
+
+2. **Routing & Authentication**:
+   - Express Router captures the route. Before forwarding to the controller, it passes the request through the `authMiddleware`.
+   - `authMiddleware` checks for the Bearer token, validates it against the environment secret, and fetches/injects the user payload (`req.user = { id: 'u-456', role: 'USER' }`). If invalid, it immediately responds with `401 Unauthorized`.
+
+3. **Schema Validation**:
+   - The request hits the `validationMiddleware(createTaskSchema)`. This uses a schema validator like **Zod** to ensure that `title` is a non-empty string, `assigneeId` is a valid UUID, and `priority` matches one of the allowed enum values (`LOW`, `MEDIUM`, `HIGH`, `URGENT`). If validation fails, it throws a `400 Bad Request` with structured validation errors.
+   
+4. **Controller Action Dispatch**:
+   - `TaskController.createTask` is triggered. It separates parameters from presentation concerns: extracts `projectId` from `req.params`, body fields from `req.body`, and `creatorId` from `req.user.id`. It passes this clean data transfer object (DTO) to `TaskService`.
+
+5. **Business Logic & Authorization Check**:
+   - `TaskService.createTask` runs.
+   - It performs permission validation: queries the repository to check if `creatorId` (u-456) is a member of `projectId` (p-123) and has a role other than `VIEWER`. If the user is not part of the project, it throws a `403 Forbidden` error.
+   - If `assigneeId` is provided, it verifies that the assignee is also a member of the project. If not, it throws a `400 Bad Request`.
+
+6. **Database Abstraction (Prisma)**:
+   - Once all business rules pass, the service requests `TaskRepository.create` to store the new entity.
+   - Prisma constructs a parameterized SQL statement and executes it safely against PostgreSQL:
+     ```sql
+     INSERT INTO "Task" ("id", "title", "projectId", "assigneeId", "creatorId", "status", "priority", "createdAt", "updatedAt")
+     VALUES ('t-uuid', 'Implement auth integration', 'p-123', 'u-789', 'u-456', 'TODO', 'HIGH', NOW(), NOW())
+     RETURNING *;
+     ```
+
+7. **Structured Response**:
+   - The database returns the newly created row. Prisma parses it into a typesafe JS object.
+   - The service returns it to the controller.
+   - The controller wraps the data inside a standardized envelope response format and sends it back to the client with an HTTP `201 Created` status code.
